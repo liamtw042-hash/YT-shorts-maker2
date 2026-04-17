@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-make_short.py - Creates a ranked YouTube Short from video clips.
+make_short.py - Creates a professional ranked YouTube Short from video clips.
 
 Mode 1 (auto): Pass a YouTube URL or local video file.
                Finds the 5 most interesting moments via motion detection.
@@ -8,8 +8,8 @@ Mode 1 (auto): Pass a YouTube URL or local video file.
 Mode 2 (manual): Omit the argument; reads up to 5 URLs/paths from clips.txt.
                  Finds the best 5-second moment in each clip.
 
-Both modes produce a 9:16 vertical Short with countdown overlays (5→1),
-whoosh transitions, optional background music, and exports as output.mp4.
+Output structure:
+  [1s TOP 5 intro] → [0.4s countdown] → [5s clip #5] → ... → [5s clip #1]
 
 Requires: yt-dlp, ffmpeg (system), opencv-python, numpy
 """
@@ -28,11 +28,16 @@ import numpy as np
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
-TARGET_W = 1080
-TARGET_H = 1920
+TARGET_W     = 1080
+TARGET_H     = 1920
 CLIP_DURATION = 5.0
-NUM_CLIPS = 5
-WHOOSH_DUR = 0.45
+INTRO_DUR    = 1.0    # "TOP 5" hook screen
+COUNTDOWN_DUR = 0.4   # rank flash before each clip
+FADE_DUR     = 0.3    # fade-to-black at end of each clip
+WHOOSH_DUR   = 0.45
+NUM_CLIPS    = 5
+
+SEGMENT_DUR  = COUNTDOWN_DUR + CLIP_DURATION   # 5.4 s per rank slot
 
 FONT_CANDIDATES = [
     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
@@ -67,8 +72,12 @@ def _find_font() -> str | None:
 
 
 def _escape_fontpath(path: str) -> str:
-    # ffmpeg drawtext requires forward slashes and escaped colons
     return path.replace("\\", "/").replace(":", "\\:")
+
+
+def _font_opt() -> str:
+    fp = _find_font()
+    return f":fontfile='{_escape_fontpath(fp)}'" if fp else ""
 
 
 # ── Download ───────────────────────────────────────────────────────────────────
@@ -87,7 +96,6 @@ def download_video(url: str, dest: str) -> None:
 # ── Motion analysis ────────────────────────────────────────────────────────────
 
 def _motion_scores(video_path: str):
-    """Return [(timestamp_sec, motion_score), ...] sampled at ~4 fps."""
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     interval = max(1, int(fps / 4))
@@ -110,8 +118,8 @@ def _motion_scores(video_path: str):
 
 
 def find_top_moments(video_path: str, n: int = NUM_CLIPS) -> list:
-    """Return n timestamps (sec) of highest-motion moments with minimum spacing."""
-    scores, fps = _motion_scores(video_path)
+    """Return n start-timestamps (sec) of highest-motion moments, min-spaced."""
+    scores, _ = _motion_scores(video_path)
 
     cap = cv2.VideoCapture(video_path)
     duration = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) / (cap.get(cv2.CAP_PROP_FPS) or 30)
@@ -132,7 +140,8 @@ def find_top_moments(video_path: str, n: int = NUM_CLIPS) -> list:
 
     for idx in np.argsort(vals)[::-1]:
         t = timestamps[idx]
-        t = max(CLIP_DURATION / 2, min(duration - CLIP_DURATION / 2, t))
+        # Clamp so a 5-second clip starting at t fits inside the video
+        t = max(0.0, min(duration - CLIP_DURATION, t))
         if not any(abs(t - s) < min_gap for s in selected):
             selected.append(t)
         if len(selected) == n:
@@ -151,54 +160,105 @@ def find_best_moment(video_path: str) -> float:
     return find_top_moments(video_path, n=1)[0]
 
 
-# ── Per-clip processing (ffmpeg) ───────────────────────────────────────────────
+# ── Black-screen title clips ───────────────────────────────────────────────────
 
-def process_clip_ffmpeg(source_path: str, center_time: float, rank: int, output_path: str) -> None:
-    """Extract 5-second clip, crop to 9:16, burn rank number overlay — pure ffmpeg."""
-    t_start = max(0.0, center_time - CLIP_DURATION / 2)
+def _black_clip(duration: float, vf: str, output_path: str) -> None:
+    """Render a black-background title/countdown clip with the given vf chain."""
+    subprocess.run([
+        "ffmpeg", "-y",
+        "-f", "lavfi", "-i", f"color=black:size={TARGET_W}x{TARGET_H}:rate=30",
+        "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
+        "-t", str(duration),
+        "-vf", vf,
+        "-filter_complex", "[1:a]aresample=44100[audio]",
+        "-map", "0:v", "-map", "[audio]",
+        "-c:v", "libx264", "-crf", "23", "-preset", "medium",
+        "-c:a", "aac", "-ar", "44100", "-ac", "2",
+        output_path,
+    ], check=True, stderr=subprocess.DEVNULL)
 
-    # scale+crop to exact 9:16, preserving centre
+
+def generate_intro_clip(output_path: str) -> None:
+    """1-second 'TOP 5' hook screen."""
+    fo = _font_opt()
+    vf = (
+        f"drawtext=text='TOP 5'{fo}:fontsize=300"
+        f":fontcolor=white:borderw=22:bordercolor=black"
+        f":x=(w-text_w)/2:y=(h-text_h)/2"
+    )
+    _black_clip(INTRO_DUR, vf, output_path)
+
+
+def generate_countdown_clip(rank: int, output_path: str) -> None:
+    """0.4-second rank-number flash on black — the countdown beat."""
+    fo = _font_opt()
+    vf = (
+        f"drawtext=text='{rank}'{fo}:fontsize=400"
+        f":fontcolor=white:borderw=28:bordercolor=black"
+        f":x=(w-text_w)/2:y=(h-text_h)/2"
+    )
+    _black_clip(COUNTDOWN_DUR, vf, output_path)
+
+
+# ── Per-clip processing ────────────────────────────────────────────────────────
+
+def process_clip_ffmpeg(source_path: str, start_time: float, rank: int, output_path: str) -> None:
+    """
+    Extract 5-second clip starting at start_time, crop to 9:16,
+    burn rank overlay + 'RANKED DAILY' label, fade to black at end.
+    """
+    t_start = max(0.0, start_time)
+
     scale_crop = (
         f"scale={TARGET_W}:{TARGET_H}:force_original_aspect_ratio=increase,"
         f"crop={TARGET_W}:{TARGET_H}"
     )
 
-    fp = _find_font()
-    font_opt = f":fontfile='{_escape_fontpath(fp)}'" if fp else ""
-    show = f":enable='between(t,0,2.5)'"
+    fo = _font_opt()
 
-    # Two drawtext layers: gold drop-shadow then white text with black border
+    # Rank number: top-left, gold drop-shadow + white with thick black border
     dt_shadow = (
-        f"drawtext=text='{rank}'{font_opt}:fontsize=350"
-        f":fontcolor='0xC8A000@0.7':x=(w-text_w)/2+8:y=(h-text_h)/2+8{show}"
+        f"drawtext=text='{rank}'{fo}:fontsize=180"
+        f":fontcolor='0xFFD700@0.85':x=44:y=44"
     )
-    dt_main = (
-        f"drawtext=text='{rank}'{font_opt}:fontsize=350"
-        f":fontcolor=white:borderw=14:bordercolor=black"
-        f":x=(w-text_w)/2:y=(h-text_h)/2{show}"
+    dt_rank = (
+        f"drawtext=text='{rank}'{fo}:fontsize=180"
+        f":fontcolor=white:borderw=14:bordercolor=black:x=40:y=40"
     )
-    vf = f"{scale_crop},{dt_shadow},{dt_main}"
+
+    # "RANKED DAILY" small-caps label at bottom
+    dt_label = (
+        f"drawtext=text='RANKED DAILY'{fo}:fontsize=52"
+        f":fontcolor=white:borderw=4:bordercolor=black"
+        f":x=(w-text_w)/2:y=h-100"
+    )
+
+    # Fade to black at end
+    fade = f"fade=t=out:st={CLIP_DURATION - FADE_DUR}:d={FADE_DUR}"
+
+    vf = f"{scale_crop},{dt_shadow},{dt_rank},{dt_label},{fade}"
+    af = f"afade=t=out:st={CLIP_DURATION - FADE_DUR}:d={FADE_DUR}"
 
     if _has_audio(source_path):
         cmd = [
             "ffmpeg", "-y",
             "-ss", str(t_start), "-i", source_path,
             "-t", str(CLIP_DURATION),
-            "-vf", vf,
+            "-vf", vf, "-af", af,
             "-map", "0:v", "-map", "0:a",
             "-c:v", "libx264", "-crf", "23", "-preset", "medium",
             "-c:a", "aac", "-ar", "44100", "-ac", "2",
             output_path,
         ]
     else:
-        # Inject a silent audio track so concat demuxer sees consistent streams
         cmd = [
             "ffmpeg", "-y",
             "-ss", str(t_start), "-i", source_path,
             "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
             "-t", str(CLIP_DURATION),
             "-vf", vf,
-            "-filter_complex", "[1:a]aresample=44100[audio]",
+            "-filter_complex",
+            f"[1:a]aresample=44100,afade=t=out:st={CLIP_DURATION - FADE_DUR}:d={FADE_DUR}[audio]",
             "-map", "0:v", "-map", "[audio]",
             "-c:v", "libx264", "-crf", "23", "-preset", "medium",
             "-c:a", "aac", "-ar", "44100", "-ac", "2",
@@ -210,22 +270,19 @@ def process_clip_ffmpeg(source_path: str, center_time: float, rank: int, output_
 
 # ── Whoosh sound ───────────────────────────────────────────────────────────────
 
-def generate_whoosh_wav(output_path: str, duration: float = WHOOSH_DUR, sr: int = 44100) -> None:
+def generate_whoosh_wav(output_path: str, sr: int = 44100) -> None:
     """Synthesise a high→low whoosh and write as 16-bit mono WAV."""
-    n = int(sr * duration)
-    t = np.linspace(0, duration, n, dtype=np.float32)
-
-    freqs = 1400.0 * np.exp(-5.0 * t / duration) + 80.0
+    n = int(sr * WHOOSH_DUR)
+    t = np.linspace(0, WHOOSH_DUR, n, dtype=np.float32)
+    freqs = 1400.0 * np.exp(-5.0 * t / WHOOSH_DUR) + 80.0
     tone = np.sin(2 * np.pi * np.cumsum(freqs) / sr)
     noise = np.convolve(
         np.random.normal(0, 1.0, n).astype(np.float32),
-        np.ones(30, dtype=np.float32) / 30,
-        mode="same",
+        np.ones(30, dtype=np.float32) / 30, mode="same",
     )
     sig = tone * 0.55 + noise * 0.45
-    env = np.exp(-5.0 * t / duration)
+    env = np.exp(-5.0 * t / WHOOSH_DUR)
     env[: int(0.03 * sr)] *= np.linspace(0, 1, int(0.03 * sr), dtype=np.float32)
-
     pcm = np.clip(sig * env * 0.8 * 32767, -32768, 32767).astype(np.int16)
     with wave.open(output_path, "w") as wf:
         wf.setnchannels(1)
@@ -234,56 +291,60 @@ def generate_whoosh_wav(output_path: str, duration: float = WHOOSH_DUR, sr: int 
         wf.writeframes(pcm.tobytes())
 
 
-# ── Final assembly (ffmpeg) ────────────────────────────────────────────────────
+# ── Final assembly ─────────────────────────────────────────────────────────────
 
 def build_final_video(
+    intro_path: str,
+    countdown_paths: list,
     clip_paths: list,
     whoosh_path: str,
     music_path: str | None,
     output_path: str,
     tmp: str,
 ) -> None:
-    """Concatenate clips then mix whoosh transitions and background music via ffmpeg."""
-    n_clips = len(clip_paths)
-    total_dur = CLIP_DURATION * n_clips
+    """
+    Assemble: intro → [countdown + clip] × N
+    Mix in whoosh transitions and background music, export final MP4.
+    """
+    n_clips    = len(clip_paths)
     n_whooshes = n_clips - 1
+    total_dur  = INTRO_DUR + n_clips * SEGMENT_DUR
 
-    # Step 1: concatenate processed clips (all share codec/resolution/sample-rate)
-    print("  Concatenating clips...")
+    # ── Concatenate all segments ───────────────────────────────────────────────
+    print("  Concatenating segments...")
     concat_list = os.path.join(tmp, "concat.txt")
     with open(concat_list, "w") as f:
-        for p in clip_paths:
-            f.write(f"file '{p}'\n")
-            f.write(f"duration {CLIP_DURATION}\n")
+        f.write(f"file '{intro_path}'\nduration {INTRO_DUR}\n")
+        for cd, cp in zip(countdown_paths, clip_paths):
+            f.write(f"file '{cd}'\nduration {COUNTDOWN_DUR}\n")
+            f.write(f"file '{cp}'\nduration {CLIP_DURATION}\n")
 
     concat_raw = os.path.join(tmp, "concat_raw.mp4")
     subprocess.run([
-        "ffmpeg", "-y",
-        "-f", "concat", "-safe", "0",
-        "-i", concat_list,
-        "-c", "copy",
-        concat_raw,
+        "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+        "-i", concat_list, "-c", "copy", concat_raw,
     ], check=True, stderr=subprocess.DEVNULL)
 
-    # Step 2: pre-loop music to exact length (avoids complex aloop filter maths)
+    # ── Pre-loop music ─────────────────────────────────────────────────────────
     looped_music: str | None = None
     if music_path:
         looped_music = os.path.join(tmp, "music_looped.wav")
         subprocess.run([
-            "ffmpeg", "-y",
-            "-stream_loop", "-1",
-            "-i", music_path,
+            "ffmpeg", "-y", "-stream_loop", "-1", "-i", music_path,
             "-t", str(total_dur),
             "-c:a", "pcm_s16le", "-ar", "44100", "-ac", "2",
             looped_music,
         ], check=True, stderr=subprocess.DEVNULL)
 
-    # Step 3: build filter_complex to mix original audio + delayed whooshes + music
+    # ── Audio filter_complex: whooshes + background music ─────────────────────
     #
     # Input layout:
-    #   [0]  concat_raw.mp4
-    #   [1…n_whooshes]  whoosh.wav  (one per transition)
+    #   [0]             concat_raw.mp4
+    #   [1 … n_whooshes]  whoosh.wav  (one per transition)
     #   [n_whooshes+1]  music_looped.wav  (optional)
+    #
+    # Whoosh i fires WHOOSH_DUR before the cut after clip i:
+    #   delay = INTRO_DUR + (i+1)*SEGMENT_DUR - WHOOSH_DUR
 
     inputs = ["-i", concat_raw]
     for _ in range(n_whooshes):
@@ -292,15 +353,13 @@ def build_final_video(
         inputs += ["-i", looped_music]
 
     filter_parts = []
-
-    # Delay each whoosh so it lands WHOOSH_DUR seconds before the cut
     for i in range(n_whooshes):
-        delay_ms = int((CLIP_DURATION * (i + 1) - WHOOSH_DUR) * 1000)
+        delay_ms = int((INTRO_DUR + (i + 1) * SEGMENT_DUR - WHOOSH_DUR) * 1000)
         filter_parts.append(f"[{i + 1}:a]adelay={delay_ms}|{delay_ms}[w{i}]")
 
     if looped_music:
         mi = 1 + n_whooshes
-        filter_parts.append(f"[{mi}:a]volume=0.15[bg]")
+        filter_parts.append(f"[{mi}:a]volume=0.12[bg]")
 
     whoosh_labels = "".join(f"[w{i}]" for i in range(n_whooshes))
     bg_label = "[bg]" if looped_music else ""
@@ -315,8 +374,7 @@ def build_final_video(
         "ffmpeg", "-y",
         *inputs,
         "-filter_complex", ";".join(filter_parts),
-        "-map", "0:v",
-        "-map", "[aout]",
+        "-map", "0:v", "-map", "[aout]",
         "-c:v", "copy",
         "-c:a", "aac", "-b:a", "192k",
         output_path,
@@ -329,17 +387,15 @@ def main():
     parser = argparse.ArgumentParser(description="Create a ranked YouTube Short.")
     parser.add_argument("input", nargs="?",
         help="YouTube URL or local video file (Mode 1). Omit for clips.txt (Mode 2).")
-    parser.add_argument("--clips", default="clips.txt", metavar="FILE",
-        help="Clips list for Mode 2 (default: clips.txt)")
-    parser.add_argument("--music", default="music.mp3", metavar="FILE",
-        help="Background music file (default: music.mp3)")
-    parser.add_argument("--output", default="output.mp4", metavar="FILE",
-        help="Output filename (default: output.mp4)")
+    parser.add_argument("--clips", default="clips.txt", metavar="FILE")
+    parser.add_argument("--music", default="music.mp3", metavar="FILE")
+    parser.add_argument("--output", default="output.mp4", metavar="FILE")
     args = parser.parse_args()
 
     with tempfile.TemporaryDirectory() as tmp:
         sources: list[tuple[str, float]] = []
 
+        # ── Source acquisition ─────────────────────────────────────────────────
         if args.input:
             print("Mode 1: Auto-clip from single video")
             if args.input.startswith("http"):
@@ -357,8 +413,7 @@ def main():
         else:
             print("Mode 2: Using clips from clips.txt")
             if not os.path.exists(args.clips):
-                sys.exit(f"Error: {args.clips} not found. "
-                         "Create it with one URL or file path per line.")
+                sys.exit(f"Error: {args.clips} not found.")
 
             with open(args.clips) as fh:
                 entries = [ln.strip() for ln in fh if ln.strip() and not ln.startswith("#")]
@@ -385,30 +440,48 @@ def main():
         if not sources:
             sys.exit("Error: No valid clips to process.")
 
-        # Process each clip: crop, scale, burn rank number
-        print("\nProcessing clips...")
         n = len(sources)
+
+        # ── Build title intro ──────────────────────────────────────────────────
+        print("\nGenerating intro screen...")
+        intro_path = os.path.join(tmp, "intro.mp4")
+        generate_intro_clip(intro_path)
+
+        # ── Process clips + countdown screens ─────────────────────────────────
+        # sources are sorted chronologically; rank 5 = index 0, rank 1 = index n-1
+        print("\nProcessing clips...")
         clip_paths = []
+        countdown_paths = []
+
         for i, (path, t) in enumerate(sources):
             rank = n - i   # 5, 4, 3, 2, 1
-            out = os.path.join(tmp, f"processed_{i}.mp4")
             print(f"  Clip {i + 1}/{n} → Rank #{rank}  (t={t:.1f}s)")
-            process_clip_ffmpeg(path, t, rank, out)
-            clip_paths.append(out)
 
-        # Generate whoosh WAV
+            cd_path = os.path.join(tmp, f"countdown_{i}.mp4")
+            generate_countdown_clip(rank, cd_path)
+            countdown_paths.append(cd_path)
+
+            cl_path = os.path.join(tmp, f"processed_{i}.mp4")
+            process_clip_ffmpeg(path, t, rank, cl_path)
+            clip_paths.append(cl_path)
+
+        # ── Whoosh + music ─────────────────────────────────────────────────────
         whoosh_path = os.path.join(tmp, "whoosh.wav")
         generate_whoosh_wav(whoosh_path)
 
         music_path = args.music if os.path.exists(args.music) else None
         if not music_path:
-            label = "no music.mp3 found" if args.music == "music.mp3" else f"{args.music} not found"
-            print(f"Note: {label} — skipping background music")
+            tag = "no music.mp3 found" if args.music == "music.mp3" else f"{args.music} not found"
+            print(f"Note: {tag} — skipping background music")
         else:
-            print(f"Background music: {args.music}")
+            print(f"Background music: {args.music} (12% volume)")
 
+        # ── Assemble final video ───────────────────────────────────────────────
         print("\nBuilding final video...")
-        build_final_video(clip_paths, whoosh_path, music_path, args.output, tmp)
+        build_final_video(
+            intro_path, countdown_paths, clip_paths,
+            whoosh_path, music_path, args.output, tmp,
+        )
         print(f"\nDone!  Saved to: {os.path.abspath(args.output)}")
 
 
