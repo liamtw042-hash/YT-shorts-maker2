@@ -1,0 +1,6 @@
+# clips.txt — Mode 2: paste up to 5 YouTube URLs or local file paths, one per line.
+# Lines starting with # are ignored.
+#
+# Examples:
+# https://www.youtube.com/watch?v=XXXXXXXXXXX
+# /path/to/local/video.mp4
