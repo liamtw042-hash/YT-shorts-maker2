@@ -56,7 +56,7 @@ FONT_CANDIDATES = [
 def download_video(url: str, dest: str) -> None:
     print(f"  Downloading: {url}")
     cmd = [
-        "yt-dlp",
+        sys.executable, "-m", "yt_dlp",
         "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
         "--merge-output-format", "mp4",
         "-o", dest,
