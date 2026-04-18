@@ -1,48 +1,53 @@
 #!/usr/bin/env python3
 """
-make_short.py — Professional ranked YouTube Short generator.
+make_short.py — RankZilla-style ranked YouTube Short generator.
 
-Mode 1 (auto): python make_short.py <URL|file>
-               Auto-detects 5 key moments via motion analysis and cuts
-               each clip to its natural action window (3–8 s).
+Reads 5 YouTube URLs from clips.txt, ranks them by excitement score
+(motion analysis), then assembles a countdown reveal Short:
+  rank #5 (least exciting) first → rank #1 (most exciting) last.
 
-Mode 2 (manual): python make_short.py
-                 Reads up to 5 entries from clips.txt; finds the best
-                 natural-window moment in each.
+Usage:
+    python make_short.py --title "Ranking Funniest" --subtitle "Memes 2026"
 
-Output structure:
-  [0.8s intro "TOP 5"] →
-  clip #5  → [0.5s "#4"] → clip #4 → [0.5s "#3"] → clip #3 →
-  [0.5s "#2"] → clip #2 → [0.5s "#1"] → clip #1 → [0.5s outro]
+clips.txt format — one URL per line, exactly 5 lines:
+    https://youtube.com/shorts/xxx
+    https://youtube.com/shorts/xxx
+    ...
 
 Requires: ffmpeg (system), yt-dlp (pip), opencv-python (pip), numpy (pip)
 """
 
 import json
 import os
+import shutil
 import sys
+import time
 import argparse
 import tempfile
 import subprocess
-import wave
 
 import cv2
 import numpy as np
 
 
-# ── Constants ──────────────────────────────────────────────────────────────────
+# ── Layout constants ───────────────────────────────────────────────────────────
 
-TARGET_W     = 1080
-TARGET_H     = 1920
-INTRO_DUR    = 0.8
-TRANS_DUR    = 0.5    # black transition screen between clips
-OUTRO_DUR    = 0.5
-FADE_DUR     = 0.25   # fade to black at end of each clip
-MIN_CLIP     = 3.0
-MAX_CLIP     = 8.0
-NUM_CLIPS    = 5
-WHOOSH_DUR   = 0.45
-MUSIC_VOL    = 0.10
+TARGET_W  = 1080
+TARGET_H  = 1920
+FPS       = 30
+BANNER_H  = 120          # title strip height at top
+NUM_CLIPS = 5
+MAX_RETRY = 3
+
+# Vertical center (px) for each rank label in the left sidebar.
+# Usable area below banner: y=120 to y=1920 (1800 px).
+# 5 slots, 200 px apart, centred in the usable area.
+_CTR = 1020              # midpoint of usable area
+RANK_Y = {r: _CTR + (r - 3) * 200 for r in range(1, 6)}
+# → rank1:620  rank2:820  rank3:1020  rank4:1220  rank5:1420
+
+MIN_WIN = 4.0            # minimum clip window (seconds)
+MAX_WIN = 8.0            # maximum clip window (seconds)
 
 FONT_CANDIDATES = [
     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
@@ -57,18 +62,6 @@ FONT_CANDIDATES = [
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
-def _has_audio(path: str) -> bool:
-    r = subprocess.run(
-        ["ffprobe", "-v", "quiet", "-print_format", "json",
-         "-show_streams", "-select_streams", "a", path],
-        capture_output=True, text=True,
-    )
-    try:
-        return bool(json.loads(r.stdout).get("streams"))
-    except Exception:
-        return False
-
-
 def _find_font() -> str | None:
     for fp in FONT_CANDIDATES:
         if os.path.exists(fp):
@@ -77,52 +70,129 @@ def _find_font() -> str | None:
 
 
 def _fo() -> str:
+    """fontfile option string for ffmpeg drawtext, or '' if not found."""
     fp = _find_font()
-    return f":fontfile='{fp.replace(chr(92), '/').replace(':', chr(92) + ':')}'" if fp else ""
+    if not fp:
+        return ""
+    return f":fontfile='{fp.replace(chr(92), '/').replace(':', chr(92) + ':')}'"
 
 
-def _run(cmd: list, *, silent: bool = True) -> None:
-    subprocess.run(
-        cmd,
-        check=True,
-        stderr=subprocess.DEVNULL if silent else None,
-    )
+def _esc(text: str) -> str:
+    """Escape text for use inside ffmpeg drawtext=text='...'"""
+    return (text
+            .replace("\\", "\\\\")
+            .replace("'",  "\\'")
+            .replace(":",  "\\:")
+            .replace("%",  "\\%"))
+
+
+def _has_audio(path: str) -> bool:
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-print_format", "json",
+             "-show_streams", "-select_streams", "a", path],
+            capture_output=True, text=True, timeout=30,
+        )
+        return bool(json.loads(r.stdout).get("streams"))
+    except Exception:
+        return False
+
+
+def _run(cmd: list, label: str = "") -> None:
+    """
+    Run a subprocess command.  On failure, print full stderr and raise.
+    On success, stay silent (ffmpeg is very chatty).
+    """
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        tag = f" [{label}]" if label else ""
+        raise RuntimeError(
+            f"Command failed{tag} (exit {result.returncode})\n"
+            f"CMD: {' '.join(str(x) for x in cmd[:8])} ...\n"
+            f"STDERR (last 4000 chars):\n{result.stderr[-4000:]}"
+        )
+
+
+def _verify(path: str, label: str = "") -> None:
+    """Raise if path does not exist or is empty."""
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        raise RuntimeError(
+            f"Expected output missing or empty{' [' + label + ']' if label else ''}: {path}"
+        )
 
 
 # ── Download ───────────────────────────────────────────────────────────────────
 
-def download_video(url: str, dest: str) -> None:
-    print(f"  Downloading: {url}")
-    _run([
-        sys.executable, "-m", "yt_dlp",
-        "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-        "--merge-output-format", "mp4",
-        "-o", dest, url,
-    ], silent=False)
-    print("  Done.")
+def download_clip(url: str, dest: str) -> None:
+    """
+    Download with up to MAX_RETRY attempts.
+    Verifies the file exists and is non-empty.
+    Exits the whole program on permanent failure — never silently skips.
+    """
+    for attempt in range(1, MAX_RETRY + 1):
+        print(f"  [{attempt}/{MAX_RETRY}] Downloading: {url}")
+        try:
+            subprocess.run(
+                [
+                    sys.executable, "-m", "yt_dlp",
+                    "--no-playlist",
+                    "--merge-output-format", "mp4",
+                    "--format",
+                    "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best",
+                    "--retries", "10",
+                    "--fragment-retries", "10",
+                    "-o", dest,
+                    url,
+                ],
+                check=True,
+                timeout=600,
+            )
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+            print(f"  Attempt {attempt} failed: {exc}")
+            if attempt < MAX_RETRY:
+                wait = 4 * attempt
+                print(f"  Waiting {wait}s before retry...")
+                time.sleep(wait)
+                continue
+            sys.exit(
+                f"\nERROR: Could not download after {MAX_RETRY} attempts.\n"
+                f"URL: {url}\nLast error: {exc}"
+            )
+
+        if os.path.exists(dest) and os.path.getsize(dest) > 0:
+            kb = os.path.getsize(dest) // 1024
+            print(f"  OK ({kb} KB): {os.path.basename(dest)}")
+            return
+
+        print(f"  File missing or empty after attempt {attempt}.")
+        if attempt == MAX_RETRY:
+            sys.exit(f"\nERROR: Download produced empty file after {MAX_RETRY} attempts.\nURL: {url}")
+        time.sleep(4 * attempt)
 
 
 # ── Motion analysis ────────────────────────────────────────────────────────────
 
-def analyse_video(video_path: str) -> tuple[list, list, float, float]:
+def analyse_video(path: str) -> tuple[list, list, float, float]:
     """
-    Sample motion scores at ~4 fps using frame-diff.
+    Sample frame-diff motion at ~4 fps using cv2.
     Returns (timestamps, scores, fps, duration).
     """
-    cap = cv2.VideoCapture(video_path)
+    cap = cv2.VideoCapture(path)
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    duration = total / fps
-    interval = max(1, int(fps / 4))
+    duration = total / fps if total > 0 else 0.0
+    step = max(1, int(fps / 4))
 
     timestamps, scores, prev_gray, idx = [], [], None, 0
     while True:
         ok, frame = cap.read()
         if not ok:
             break
-        if idx % interval == 0:
+        if idx % step == 0:
             sm = cv2.resize(frame, (320, 240))
-            gray = cv2.GaussianBlur(cv2.cvtColor(sm, cv2.COLOR_BGR2GRAY), (21, 21), 0)
+            gray = cv2.GaussianBlur(
+                cv2.cvtColor(sm, cv2.COLOR_BGR2GRAY), (21, 21), 0
+            )
             if prev_gray is not None:
                 timestamps.append(idx / fps)
                 scores.append(float(np.mean(cv2.absdiff(prev_gray, gray))))
@@ -133,185 +203,160 @@ def analyse_video(video_path: str) -> tuple[list, list, float, float]:
     return timestamps, scores, fps, duration
 
 
-def find_top_moments(timestamps: list, scores: list, duration: float,
-                     n: int = NUM_CLIPS) -> list:
-    """Return n start-timestamps of highest-motion moments, min-spaced."""
+def excitement_score(scores: list) -> float:
+    """80th-percentile motion as clip excitement metric."""
+    return float(np.percentile(scores, 80)) if scores else 0.0
+
+
+def best_window(timestamps: list, scores: list, duration: float) -> tuple[float, float]:
+    """
+    Find the highest-motion natural action window (MIN_WIN–MAX_WIN seconds).
+    Walks outward from the peak frame until motion drops below 30% of peak,
+    then clamps duration to [MIN_WIN, MAX_WIN].
+    """
+    if duration <= MAX_WIN:
+        return 0.0, duration
     if not scores:
-        step = duration / (n + 1)
-        return [step * (i + 1) for i in range(n)]
-
-    vals = np.array(scores)
-    window = min(16, max(1, len(vals) // 10))
-    if window > 1:
-        vals = np.convolve(vals, np.ones(window) / window, mode="same")
-
-    ts = np.array(timestamps)
-    min_gap = MAX_CLIP + 1.0
-    selected = []
-
-    for idx in np.argsort(vals)[::-1]:
-        t = float(ts[idx])
-        t = max(0.0, min(duration - MIN_CLIP, t))
-        if not any(abs(t - s) < min_gap for s in selected):
-            selected.append(t)
-        if len(selected) == n:
-            break
-
-    while len(selected) < n:
-        step = duration / (n + 1)
-        selected.append(step * (len(selected) + 1))
-
-    selected.sort()
-    return selected[:n]
-
-
-def natural_clip_bounds(timestamps: list, scores: list,
-                        center: float, duration: float) -> tuple[float, float]:
-    """
-    Expand outward from center until motion drops below a local threshold,
-    returning (start, end) clamped to [MIN_CLIP, MAX_CLIP] seconds.
-    """
-    if not timestamps:
-        return max(0.0, center), min(duration, center + 5.0)
+        return 0.0, min(MAX_WIN, duration)
 
     ts = np.array(timestamps)
     sc = np.array(scores)
-    ci = int(np.argmin(np.abs(ts - center)))
+    pi = int(np.argmax(sc))
+    pt = float(ts[pi])
+    thresh = float(sc[pi]) * 0.30
+    walk = int(MAX_WIN * 4)   # samples at ~4 fps
 
-    # Local mean in ±5-second window as the baseline
-    mask = (ts >= center - 5.0) & (ts <= center + 5.0)
-    base = sc[mask].mean() if mask.sum() > 3 else sc.mean()
-    thresh = base * 0.38
-
-    # Walk left to find natural start
-    start_idx = ci
-    for i in range(ci - 1, max(0, ci - int(MAX_CLIP * 4)), -1):
+    # Walk left from peak
+    s = pt
+    for i in range(pi - 1, max(0, pi - walk), -1):
         if sc[i] < thresh:
-            start_idx = i + 1
+            s = float(ts[i + 1])
             break
-        start_idx = i
+        s = float(ts[i])
 
-    # Walk right to find natural end
-    end_idx = ci
-    for i in range(ci + 1, min(len(ts), ci + int(MAX_CLIP * 4))):
+    # Walk right from peak
+    e = pt
+    for i in range(pi + 1, min(len(ts), pi + walk)):
         if sc[i] < thresh:
-            end_idx = i - 1
+            e = float(ts[i - 1])
             break
-        end_idx = i
+        e = float(ts[i])
 
-    s, e = float(ts[start_idx]), float(ts[end_idx])
+    # Enforce min/max duration
     dur = e - s
-
-    # Enforce min / max
-    if dur < MIN_CLIP:
+    if dur < MIN_WIN:
         mid = (s + e) / 2.0
-        s, e = mid - MIN_CLIP / 2, mid + MIN_CLIP / 2
-    elif dur > MAX_CLIP:
+        s, e = mid - MIN_WIN / 2, mid + MIN_WIN / 2
+    elif dur > MAX_WIN:
         mid = (s + e) / 2.0
-        s, e = mid - MAX_CLIP / 2, mid + MAX_CLIP / 2
+        s, e = mid - MAX_WIN / 2, mid + MAX_WIN / 2
 
-    # Clamp to video bounds
-    s = max(0.0, s)
-    e = min(duration, e)
-    if e - s < MIN_CLIP:
-        e = min(duration, s + MIN_CLIP)
-        if e == duration:
-            s = max(0.0, e - MIN_CLIP)
-
-    return s, e
+    return max(0.0, s), min(duration, e)
 
 
-# ── Black-screen segment generators ───────────────────────────────────────────
+# ── Video filter builders ──────────────────────────────────────────────────────
 
-def _black_seg(duration: float, vf: str, out: str) -> None:
-    """Render a silent black screen with the given video filter applied."""
-    _run([
-        "ffmpeg", "-y",
-        "-f", "lavfi", "-i", f"color=black:size={TARGET_W}x{TARGET_H}:rate=30",
-        "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
-        "-t", str(duration),
-        "-vf", vf,
-        "-filter_complex", "[1:a]aresample=44100[a]",
-        "-map", "0:v", "-map", "[a]",
-        "-c:v", "libx264", "-crf", "20", "-preset", "fast",
-        "-c:a", "aac", "-ar", "44100", "-ac", "2",
-        out,
-    ])
-
-
-def make_intro(out: str) -> None:
-    """0.8 s 'TOP 5' with a subtle zoom-in via zoompan."""
-    fo = _fo()
-    # Draw text first, then zoom in (z goes 1.0 → 1.3 over 24 frames)
-    vf = (
-        f"drawtext=text='TOP 5'{fo}:fontsize=260"
-        f":fontcolor=white:borderw=18:bordercolor=black"
-        f":x=(w-text_w)/2:y=(h-text_h)/2,"
-        f"zoompan=z='1.0+0.0125*on':d=1"
-        f":x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"
-        f":s={TARGET_W}x{TARGET_H}"
-    )
-    _black_seg(INTRO_DUR, vf, out)
-
-
-def make_transition(rank: int, out: str) -> None:
-    """0.5 s black screen announcing the upcoming rank — clean top-right text."""
-    fo = _fo()
-    vf = (
-        f"drawtext=text='#{rank}'{fo}:fontsize=60"
-        f":fontcolor=white:borderw=3:bordercolor=black"
-        f":x=w-text_w-55:y=55"
-    )
-    _black_seg(TRANS_DUR, vf, out)
-
-
-def make_outro(out: str) -> None:
-    """0.5 s plain black outro."""
-    _black_seg(OUTRO_DUR, "null", out)
-
-
-# ── Main clip processor ────────────────────────────────────────────────────────
-
-def process_clip(source: str, t_start: float, t_end: float,
-                 rank: int, out: str) -> float:
+def _banner_filters(w1: str, rest: str, subtitle: str, fo: str) -> list:
     """
-    Extract [t_start, t_end], crop to 9:16, burn a small pill badge (#N),
-    fade to black at the end.  Returns actual clip duration written.
+    Title banner overlay filters.
+    w1 = first word (white), rest = remaining title words (red),
+    subtitle = yellow line below.
+    """
+    x_rest = 40 + int(len(w1) * 54 * 0.60) + 10  # approximate char width
+
+    parts = [
+        f"drawbox=x=0:y=0:w={TARGET_W}:h={BANNER_H}:color=black:t=fill",
+        f"drawtext=text='{_esc(w1)}'{fo}"
+        f":fontsize=54:fontcolor=white:borderw=3:bordercolor=black:x=40:y=18",
+    ]
+    if rest:
+        parts.append(
+            f"drawtext=text='{_esc(rest)}'{fo}"
+            f":fontsize=54:fontcolor='0xFF3333':borderw=3:bordercolor=black"
+            f":x={x_rest}:y=18"
+        )
+    if subtitle:
+        parts.append(
+            f"drawtext=text='{_esc(subtitle)}'{fo}"
+            f":fontsize=32:fontcolor=yellow:borderw=2:bordercolor=black:x=40:y=78"
+        )
+    return parts
+
+
+def _rank_filters(active: int, fo: str) -> list:
+    """
+    Left-sidebar rank number filters.
+    active rank: 85 px bold yellow/white with thick black stroke.
+    others: 48 px grey semi-transparent.
+    """
+    parts = []
+    for r in range(1, NUM_CLIPS + 1):
+        cy = RANK_Y[r]
+        if r == active:
+            fs, color, bw, bc = 85, "yellow", 7, "black"
+            y = cy - 42
+        else:
+            fs, color, bw, bc = 48, "'0xBBBBBB@0.60'", 2, "'0x00000066'"
+            y = cy - 24
+        parts.append(
+            f"drawtext=text='{r}\.'{fo}"
+            f":fontsize={fs}:fontcolor={color}"
+            f":borderw={bw}:bordercolor={bc}:x=30:y={y}"
+        )
+    return parts
+
+
+def build_vf(active_rank: int, w1: str, rest: str, subtitle: str, fo: str) -> str:
+    """
+    Complete -vf filter chain for one clip segment:
+      letterbox → 1.05x zoom → title banner → rank sidebar
+    """
+    chain = [
+        # Letterbox to 1080x1920 preserving aspect ratio
+        f"scale=w={TARGET_W}:h={TARGET_H}:force_original_aspect_ratio=decrease",
+        f"pad={TARGET_W}:{TARGET_H}:(ow-iw)/2:(oh-ih)/2:black",
+        # 1.05× zoom to hide corner watermarks/text
+        f"scale=iw*1.05:ih*1.05",
+        f"crop={TARGET_W}:{TARGET_H}",
+        # Force 30 fps
+        f"fps={FPS}",
+    ]
+    chain += _banner_filters(w1, rest, subtitle, fo)
+    chain += _rank_filters(active_rank, fo)
+    return ",".join(chain)
+
+
+# ── Segment processing ─────────────────────────────────────────────────────────
+
+def process_segment(
+    source: str,
+    t_start: float, t_end: float,
+    active_rank: int,
+    w1: str, rest: str, subtitle: str,
+    fo: str,
+    out: str,
+) -> float:
+    """
+    Render one clip window with overlays burned in.
+    Returns actual clip duration (seconds).
+    Raises RuntimeError (with full stderr) on ffmpeg failure.
     """
     dur = round(t_end - t_start, 3)
-    fade_start = max(0.0, dur - FADE_DUR)
-    fo = _fo()
+    vf = build_vf(active_rank, w1, rest, subtitle, fo)
+    af = "loudnorm=I=-16:TP=-1.5:LRA=11"
 
-    scale_crop = (
-        f"scale={TARGET_W}:{TARGET_H}:force_original_aspect_ratio=increase,"
-        f"crop={TARGET_W}:{TARGET_H}"
-    )
+    base = [
+        "ffmpeg", "-y",
+        "-ss", str(t_start), "-i", source,
+        "-t", str(dur),
+        "-vf", vf,
+    ]
 
-    # Semi-transparent dark pill badge, top-right
-    badge_bg = (
-        f"drawbox=x=w-118:y=20:w=104:h=54"
-        f":color=black@0.55:t=fill"
-    )
-    badge_txt = (
-        f"drawtext=text='#{rank}'{fo}:fontsize=38"
-        f":fontcolor=white@0.92:borderw=2:bordercolor=black@0.4"
-        f":x=w-108:y=29"
-    )
-    fade_v = f"fade=t=out:st={fade_start}:d={FADE_DUR}"
-
-    vf = f"{scale_crop},{badge_bg},{badge_txt},{fade_v}"
-    af = f"afade=t=out:st={fade_start}:d={FADE_DUR}"
-
-    has_audio = _has_audio(source)
-
-    if has_audio:
-        cmd = [
-            "ffmpeg", "-y",
-            "-ss", str(t_start), "-i", source,
-            "-t", str(dur),
-            "-vf", vf, "-af", af,
+    if _has_audio(source):
+        cmd = base + [
+            "-af", af,
             "-map", "0:v", "-map", "0:a",
-            "-c:v", "libx264", "-crf", "20", "-preset", "fast",
+            "-c:v", "libx264", "-crf", "18", "-preset", "fast",
             "-c:a", "aac", "-ar", "44100", "-ac", "2",
             out,
         ]
@@ -322,259 +367,197 @@ def process_clip(source: str, t_start: float, t_end: float,
             "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
             "-t", str(dur),
             "-vf", vf,
-            "-filter_complex",
-            f"[1:a]aresample=44100,afade=t=out:st={fade_start}:d={FADE_DUR}[a]",
+            "-filter_complex", "[1:a]aresample=44100[a]",
             "-map", "0:v", "-map", "[a]",
-            "-c:v", "libx264", "-crf", "20", "-preset", "fast",
+            "-c:v", "libx264", "-crf", "18", "-preset", "fast",
             "-c:a", "aac", "-ar", "44100", "-ac", "2",
             out,
         ]
 
-    _run(cmd)
+    _run(cmd, label=f"segment rank#{active_rank}")
+    _verify(out, f"segment rank#{active_rank}")
     return dur
 
 
-# ── Whoosh ─────────────────────────────────────────────────────────────────────
-
-def make_whoosh(out: str, sr: int = 44100) -> None:
-    n = int(sr * WHOOSH_DUR)
-    t = np.linspace(0, WHOOSH_DUR, n, dtype=np.float32)
-    freqs = 1400.0 * np.exp(-5.0 * t / WHOOSH_DUR) + 80.0
-    tone = np.sin(2 * np.pi * np.cumsum(freqs) / sr)
-    noise = np.convolve(
-        np.random.normal(0, 1.0, n).astype(np.float32),
-        np.ones(30, dtype=np.float32) / 30, mode="same",
-    )
-    sig = tone * 0.55 + noise * 0.45
-    env = np.exp(-5.0 * t / WHOOSH_DUR)
-    env[: int(0.03 * sr)] *= np.linspace(0, 1, int(0.03 * sr), dtype=np.float32)
-    pcm = np.clip(sig * env * 0.8 * 32767, -32768, 32767).astype(np.int16)
-    with wave.open(out, "w") as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)
-        wf.setframerate(sr)
-        wf.writeframes(pcm.tobytes())
-
-
-# ── Final assembly ─────────────────────────────────────────────────────────────
+# ── Assembly ───────────────────────────────────────────────────────────────────
 
 def assemble(
-    intro_path: str,
-    segments: list,        # [(trans_path|None, clip_path, clip_dur), ...]
-    outro_path: str,
-    whoosh_path: str,
+    seg_files: list,
+    seg_durs: list,
     music_path: str | None,
-    output_path: str,
+    output: str,
     tmp: str,
 ) -> None:
-    """
-    Concatenate all segments, mix whoosh at each clip→transition boundary,
-    and optionally mix in background music.
-    """
-    # ── Build concat list ──────────────────────────────────────────────────────
-    all_files: list[tuple[str, float]] = [(intro_path, INTRO_DUR)]
-    for trans_path, clip_path, clip_dur in segments:
-        all_files.append((clip_path, clip_dur))
-        if trans_path:
-            all_files.append((trans_path, TRANS_DUR))
-    all_files.append((outro_path, OUTRO_DUR))
+    """Concatenate segments; optionally mix background music at 10% volume."""
+    total_dur = sum(seg_durs)
 
-    total_dur = sum(d for _, d in all_files)
+    concat_txt = os.path.join(tmp, "concat.txt")
+    with open(concat_txt, "w") as f:
+        for sf, dur in zip(seg_files, seg_durs):
+            f.write(f"file '{sf}'\nduration {dur}\n")
 
-    concat_list = os.path.join(tmp, "concat.txt")
-    with open(concat_list, "w") as f:
-        for path, dur in all_files:
-            f.write(f"file '{path}'\nduration {dur}\n")
-
-    print("  Concatenating segments...")
     concat_raw = os.path.join(tmp, "concat_raw.mp4")
+    print("  Concatenating segments...")
     _run([
         "ffmpeg", "-y", "-f", "concat", "-safe", "0",
-        "-i", concat_list, "-c", "copy", concat_raw,
-    ])
+        "-i", concat_txt, "-c", "copy", concat_raw,
+    ], label="concat")
+    _verify(concat_raw, "concat")
 
-    # ── Pre-loop music ─────────────────────────────────────────────────────────
-    looped_music: str | None = None
-    if music_path:
-        looped_music = os.path.join(tmp, "music_loop.wav")
+    if not music_path:
+        shutil.copy2(concat_raw, output)
+        return
+
+    # Pre-loop music to total duration
+    looped = os.path.join(tmp, "music_loop.wav")
+    print(f"  Looping music to {total_dur:.1f}s...")
+    try:
         _run([
-            "ffmpeg", "-y", "-stream_loop", "-1", "-i", music_path,
+            "ffmpeg", "-y",
+            "-stream_loop", "-1", "-i", music_path,
             "-t", str(total_dur),
             "-c:a", "pcm_s16le", "-ar", "44100", "-ac", "2",
-            looped_music,
-        ])
+            looped,
+        ], label="music loop")
+    except RuntimeError as exc:
+        print(f"  WARNING: music loop failed, skipping music.\n  {exc}")
+        shutil.copy2(concat_raw, output)
+        return
 
-    # ── Compute whoosh delay times ─────────────────────────────────────────────
-    # Whoosh fires WHOOSH_DUR before the clip→transition cut,
-    # i.e. at (cumulative_time_at_clip_end - WHOOSH_DUR).
-    # There is one whoosh per clip except the last (which fades into outro).
-    whoosh_delays_ms: list[int] = []
-    cursor = INTRO_DUR
-    for i, (trans_path, _, clip_dur) in enumerate(segments):
-        cursor += clip_dur
-        if trans_path is not None:   # there is a transition after this clip
-            delay_ms = int((cursor - WHOOSH_DUR) * 1000)
-            whoosh_delays_ms.append(max(0, delay_ms))
-        # advance past the transition screen (if any)
-        if trans_path is not None:
-            cursor += TRANS_DUR
-
-    n_whooshes = len(whoosh_delays_ms)
-
-    # ── Build audio filter_complex ─────────────────────────────────────────────
-    inputs = ["-i", concat_raw]
-    for _ in range(n_whooshes):
-        inputs += ["-i", whoosh_path]
-    if looped_music:
-        inputs += ["-i", looped_music]
-
-    filter_parts: list[str] = []
-    for i, delay_ms in enumerate(whoosh_delays_ms):
-        filter_parts.append(f"[{i + 1}:a]adelay={delay_ms}|{delay_ms}[w{i}]")
-
-    if looped_music:
-        mi = 1 + n_whooshes
-        filter_parts.append(f"[{mi}:a]volume={MUSIC_VOL}[bg]")
-
-    whoosh_labels = "".join(f"[w{i}]" for i in range(n_whooshes))
-    bg_label = "[bg]" if looped_music else ""
-    n_mix = 1 + n_whooshes + (1 if looped_music else 0)
-    filter_parts.append(
-        f"[0:a]{whoosh_labels}{bg_label}"
-        f"amix=inputs={n_mix}:duration=first:dropout_transition=0[aout]"
-    )
-
-    print("  Mixing audio and exporting...")
+    # Mix original audio + music at 10%
+    print("  Mixing music and exporting final video...")
     _run([
         "ffmpeg", "-y",
-        *inputs,
-        "-filter_complex", ";".join(filter_parts),
+        "-i", concat_raw,
+        "-i", looped,
+        "-filter_complex",
+        "[1:a]volume=0.10[bg];"
+        "[0:a][bg]amix=inputs=2:duration=first:dropout_transition=0[aout]",
         "-map", "0:v", "-map", "[aout]",
         "-c:v", "copy",
         "-c:a", "aac", "-b:a", "192k",
-        output_path,
-    ], silent=False)
+        output,
+    ], label="final mix")
+    _verify(output, "final output")
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Create a ranked YouTube Short.")
-    parser.add_argument("input", nargs="?",
-        help="YouTube URL or local video file (Mode 1). Omit for clips.txt (Mode 2).")
-    parser.add_argument("--clips",  default="clips.txt", metavar="FILE")
-    parser.add_argument("--music",  default="music.mp3",  metavar="FILE")
-    parser.add_argument("--output", default="output.mp4", metavar="FILE")
+    parser = argparse.ArgumentParser(description="RankZilla-style YouTube Short generator.")
+    parser.add_argument("--title",    default="Ranking Top Moments",
+        help="Title text. First word shown in white, rest in red.")
+    parser.add_argument("--subtitle", default="",
+        help="Subtitle shown in yellow below the title.")
+    parser.add_argument("--clips",   default="clips.txt", metavar="FILE")
+    parser.add_argument("--music",   default="music.mp3",  metavar="FILE")
+    parser.add_argument("--output",  default="output.mp4", metavar="FILE")
     args = parser.parse_args()
 
+    # Parse title into first word (white) + remainder (red)
+    words = args.title.strip().split()
+    title_w1   = words[0] if words else "Ranking"
+    title_rest = " ".join(words[1:]) if len(words) > 1 else ""
+
+    # Load clips.txt
+    if not os.path.exists(args.clips):
+        sys.exit(
+            f"ERROR: {args.clips} not found.\n"
+            "Create it with one YouTube URL per line (5 lines)."
+        )
+    with open(args.clips) as f:
+        urls = [ln.strip() for ln in f if ln.strip() and not ln.startswith("#")]
+    if not urls:
+        sys.exit(f"ERROR: No URLs found in {args.clips}")
+    if len(urls) < NUM_CLIPS:
+        print(f"WARNING: Expected {NUM_CLIPS} URLs, found {len(urls)}. Proceeding with {len(urls)}.")
+    urls = urls[:NUM_CLIPS]
+
+    fo = _fo()
+    music_path = args.music if os.path.exists(args.music) else None
+    if music_path:
+        print(f"Music: {args.music} at 10% volume")
+    else:
+        print("No music.mp3 — skipping background music")
+
+    # ─────────────────────────────────────────────────────────────────────────
     with tempfile.TemporaryDirectory() as tmp:
 
-        # ── Acquire sources ────────────────────────────────────────────────────
-        # Each source: (video_path, timestamps, scores, fps, duration)
-        raw_sources: list[tuple[str, list, list, float, float]] = []
+        # ── STEP 1: Download ───────────────────────────────────────────────────
+        sep = "─" * 52
+        print(f"\n{sep}\nSTEP 1 / 4  Downloading {len(urls)} clips\n{sep}")
+        src_paths: list[str] = []
+        for i, url in enumerate(urls):
+            print(f"\n[{i+1}/{len(urls)}]")
+            dest = os.path.join(tmp, f"src_{i}.mp4")
+            download_clip(url, dest)
+            src_paths.append(dest)
 
-        if args.input:
-            print("Mode 1: Auto-clip from single video")
-            if args.input.startswith("http"):
-                src = os.path.join(tmp, "source.mp4")
-                download_video(args.input, src)
-            else:
-                src = args.input
-                if not os.path.exists(src):
-                    sys.exit(f"Error: not found: {src}")
+        # ── STEP 2: Analyse & rank ─────────────────────────────────────────────
+        print(f"\n{sep}\nSTEP 2 / 4  Analysing motion & ranking clips\n{sep}")
+        clips: list[dict] = []
+        for i, (path, url) in enumerate(zip(src_paths, urls)):
+            print(f"  Analysing clip {i+1}/{len(src_paths)} ...")
+            ts, sc, fps, dur = analyse_video(path)
+            exc = excitement_score(sc)
+            ws, we = best_window(ts, sc, dur)
+            clips.append(dict(path=path, url=url, score=exc,
+                               ws=ws, we=we, dur=dur))
+            print(f"    duration={dur:.1f}s  excitement={exc:.2f}"
+                  f"  window={ws:.1f}–{we:.1f}s ({we-ws:.1f}s)")
 
-            print("  Analysing motion...")
-            ts, sc, fps, dur = analyse_video(src)
-            moments = find_top_moments(ts, sc, dur, NUM_CLIPS)
-            for t in moments:
-                raw_sources.append((src, ts, sc, fps, dur, t))
+        # Sort descending by excitement → clips[0] = most exciting = rank #1
+        clips.sort(key=lambda c: c["score"], reverse=True)
 
-        else:
-            print("Mode 2: Using clips from clips.txt")
-            if not os.path.exists(args.clips):
-                sys.exit(f"Error: {args.clips} not found.")
-            with open(args.clips) as fh:
-                entries = [ln.strip() for ln in fh if ln.strip() and not ln.startswith("#")]
-            if not entries:
-                sys.exit("Error: clips.txt is empty.")
-            entries = entries[:NUM_CLIPS]
+        print("\n  Final ranking:")
+        for rank, c in enumerate(clips, 1):
+            print(f"    #{rank}  score={c['score']:.2f}  {c['url']}")
 
-            for i, entry in enumerate(entries):
-                print(f"\nClip {i + 1}/{len(entries)}: {entry}")
-                if entry.startswith("http"):
-                    path = os.path.join(tmp, f"src_{i}.mp4")
-                    download_video(entry, path)
-                else:
-                    path = entry
-                    if not os.path.exists(path):
-                        print("  Warning: not found, skipping")
-                        continue
-                ts, sc, fps, dur = analyse_video(path)
-                moments = find_top_moments(ts, sc, dur, n=1)
-                raw_sources.append((path, ts, sc, fps, dur, moments[0]))
+        # ── STEP 3: Process segments ───────────────────────────────────────────
+        print(f"\n{sep}\nSTEP 3 / 4  Processing clip segments\n{sep}")
 
-        # raw_sources elements: (path, ts, sc, fps, dur, center_time)
-        if not raw_sources:
-            sys.exit("Error: no valid clips found.")
+        # Play order: rank #5 first (index 4), rank #1 last (index 0)
+        seg_files: list[str] = []
+        seg_durs:  list[float] = []
 
-        n = len(raw_sources)
+        for play_pos, data_idx in enumerate(range(len(clips) - 1, -1, -1)):
+            active_rank = len(clips) - play_pos   # 5, 4, 3, 2, 1
+            c = clips[data_idx]
+            out = os.path.join(tmp, f"seg_{play_pos:02d}.mp4")
 
-        # ── Process clips (rank n → 1) ─────────────────────────────────────────
-        print("\nProcessing clips...")
-        processed: list[tuple[str, float]] = []   # (path, actual_dur)
+            print(f"\n  Segment {play_pos+1}/{len(clips)}: Rank #{active_rank}"
+                  f"  (excitement={c['score']:.2f})")
+            print(f"    window {c['ws']:.1f}s–{c['we']:.1f}s"
+                  f"  ({c['we']-c['ws']:.1f}s)")
 
-        for i, item in enumerate(raw_sources):
-            path, ts, sc, fps, dur, center = item
-            rank = n - i   # 5, 4, 3, 2, 1
+            try:
+                dur = process_segment(
+                    c["path"], c["ws"], c["we"],
+                    active_rank,
+                    title_w1, title_rest, args.subtitle,
+                    fo, out,
+                )
+            except RuntimeError as exc:
+                sys.exit(f"\nERROR processing rank #{active_rank}:\n{exc}")
 
-            s, e = natural_clip_bounds(ts, sc, center, dur)
-            actual_dur = round(e - s, 3)
-            print(f"  Clip {i + 1}/{n} → Rank #{rank}  "
-                  f"t={s:.1f}–{e:.1f}s  ({actual_dur:.1f}s)")
+            seg_files.append(out)
+            seg_durs.append(dur)
+            print(f"    Written: {dur:.1f}s -> {os.path.basename(out)}")
 
-            cl_path = os.path.join(tmp, f"clip_{i}.mp4")
-            process_clip(path, s, e, rank, cl_path)
-            processed.append((cl_path, actual_dur))
+        # ── STEP 4: Assemble ───────────────────────────────────────────────────
+        print(f"\n{sep}\nSTEP 4 / 4  Assembling final video\n{sep}")
+        total = sum(seg_durs)
+        print(f"  {len(seg_files)} segments, total {total:.1f}s")
 
-        # ── Generate auxiliary clips ───────────────────────────────────────────
-        print("Generating intro / transitions / outro...")
-        intro_path = os.path.join(tmp, "intro.mp4")
-        make_intro(intro_path)
+        try:
+            assemble(seg_files, seg_durs, music_path, args.output, tmp)
+        except RuntimeError as exc:
+            sys.exit(f"\nERROR assembling video:\n{exc}")
 
-        outro_path = os.path.join(tmp, "outro.mp4")
-        make_outro(outro_path)
-
-        # Build segment list with transitions between clips
-        # Structure: clip#5 (no leading trans), then trans→clip for #4..#1
-        segments: list[tuple[str | None, str, float]] = []
-        for i, (cl_path, cl_dur) in enumerate(processed):
-            rank_next = n - i - 1   # rank of the NEXT clip
-            if i < n - 1:
-                tr_path = os.path.join(tmp, f"trans_{i}.mp4")
-                make_transition(rank_next, tr_path)
-                trans = tr_path
-            else:
-                trans = None   # no transition after the last clip
-            segments.append((trans, cl_path, cl_dur))
-
-        # ── Whoosh and music ───────────────────────────────────────────────────
-        whoosh_path = os.path.join(tmp, "whoosh.wav")
-        make_whoosh(whoosh_path)
-
-        music_path = args.music if os.path.exists(args.music) else None
-        if not music_path:
-            tag = "no music.mp3" if args.music == "music.mp3" else f"{args.music} not found"
-            print(f"Note: {tag} — skipping background music")
-        else:
-            print(f"Music: {args.music} at {int(MUSIC_VOL*100)}% volume")
-
-        # ── Assemble ───────────────────────────────────────────────────────────
-        print("\nAssembling final video...")
-        assemble(
-            intro_path, segments, outro_path,
-            whoosh_path, music_path, args.output, tmp,
-        )
-        print(f"\nDone!  →  {os.path.abspath(args.output)}")
+        size_mb = os.path.getsize(args.output) / (1024 * 1024)
+        print(f"\n{'='*52}")
+        print(f"  Done!  {args.output}  ({size_mb:.1f} MB)")
+        print(f"{'='*52}")
 
 
 if __name__ == "__main__":
