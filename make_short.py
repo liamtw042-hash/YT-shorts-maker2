@@ -34,7 +34,7 @@ FPS       = 30
 BANNER_H  = 120
 NUM_CLIPS = 5
 MAX_RETRY = 3
-MIN_WIN   = 4.0   # seconds
+MIN_WIN   = 5.0   # seconds
 MAX_WIN   = 8.0   # seconds
 
 # Left-sidebar rank-number vertical centres (rank 1 top → rank 5 bottom).
@@ -208,8 +208,9 @@ def _natural_window(ts: np.ndarray, sc: np.ndarray,
 
     d = e - s
     if d < MIN_WIN:
-        mid = (s + e) / 2.0
-        s, e = max(0.0, mid - MIN_WIN / 2), min(duration, mid + MIN_WIN / 2)
+        e = min(duration, s + MIN_WIN)
+        if e - s < MIN_WIN:          # not enough room forward, pull start back
+            s = max(0.0, e - MIN_WIN)
     elif d > MAX_WIN:
         mid = (s + e) / 2.0
         s, e = mid - MAX_WIN / 2, mid + MAX_WIN / 2
@@ -398,6 +399,7 @@ def assemble(seg_files: list, seg_durs: list,
     try:
         _run([
             "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+            "-reset_timestamps", "1",
             "-i", concat_txt, "-c", "copy", concat_raw,
         ], "concat")
     except RuntimeError as exc:
