@@ -399,7 +399,6 @@ def assemble(seg_files: list, seg_durs: list,
     try:
         _run([
             "ffmpeg", "-y", "-f", "concat", "-safe", "0",
-            "-reset_timestamps", "1",
             "-i", concat_txt, "-c", "copy", concat_raw,
         ], "concat")
     except RuntimeError as exc:
